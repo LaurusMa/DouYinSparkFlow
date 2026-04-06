@@ -3,7 +3,9 @@ from utils.logger import setup_logger
 from utils.config import get_config, get_userData
 from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
+from playwright.sync_api import Response
 import time
+import json
 
 
 complates = {}
@@ -11,6 +13,33 @@ complates = {}
 config = get_config()
 userData = get_userData()
 logger = setup_logger(level=config.get("logLevel", "Info"))
+matchMode = config.get("matchMode", "nickname")
+userIDDict = {}
+
+def handle_response(response: Response):
+    """
+    只监听你要的那个接口响应
+    """
+    global userIDDict
+    # 精准匹配目标接口 URL
+    if "aweme/v1/creator/im/user_detail/" in response.url:
+        # print(f"URL: {response.url}")
+        # print(f"状态码: {response.status}")
+        try:
+            # 获取接口返回的 JSON 数据（就是你在 Network 里看到的内容）
+            json_data = response.json()
+            # print("\n📦 响应 JSON 数据：")
+            # print(json.dumps(json_data, indent=4, ensure_ascii=False))
+            for item in json_data.get("user_list", []):
+                short_id = item.get("user", {}).get("ShortId")
+                nickname = item.get("user", {}).get("nickname")
+                user_id = item.get("user_id", "")
+                userIDDict[str(short_id)] = {"nickname": nickname, "user_id": user_id}
+        except Exception as e:
+            tb = traceback.extract_tb(e.__traceback__)
+            last = tb[-1]
+            print(f"解析响应失败: {e}")
+            print(f"文件: {last.filename}, 行号: {last.lineno}, 函数: {last.name}")
 
 
 def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
@@ -66,7 +95,7 @@ def scroll_and_select_user(page, username, targets):
 
     time.sleep(config["friendListTimeout"] / 1000)  # 等待好友列表加载
 
-    found_usernames = set()
+    found_targets = set()
     # [修改] 复制一份目标列表用于追踪进度
     remaining_targets = set(targets)
 
@@ -79,7 +108,7 @@ def scroll_and_select_user(page, username, targets):
         target_elements = page.locator(target_selector).all()
 
         # [修复] 记录本轮循环前已发现的好友数，用于判断是否有新发现
-        prev_found_count = len(found_usernames)
+        prev_found_count = len(found_targets)
 
         for element in target_elements:
             try:
@@ -89,22 +118,32 @@ def scroll_and_select_user(page, username, targets):
                 )
                 targetName = span.inner_text()
 
-                if targetName in found_usernames:
+                if targetName in found_targets:
                     continue  # 已处理过，跳过
-                found_usernames.add(targetName)
+                found_targets.add(targetName)
 
                 logger.debug(f"账号 {username} 找到好友 {targetName}")
                 # 检查是否是目标用户名
-                if targetName in targets:
+                if matchMode == "short_id":
+                    targetSymbol = next((sid for sid, info in userIDDict.items() if info.get("nickname") == targetName), None)
+                else:
+                    targetSymbol = targetName
+
+                if targetSymbol in targets:
                     element.click()
-                    logger.debug(
-                        f"账号 {username} 选中目标好友 {targetName} 准备开始交互"
-                    )
+                    if matchMode == "short_id":
+                        logger.debug(
+                            f"账号 {username} 选中目标好友 {targetName} 准备开始交互"
+                        )
+                    else:
+                        logger.debug(
+                            f"账号 {username} 选中目标好友 {targetName} (ShortId: {targetSymbol}) 准备开始交互"
+                        )
                     yield targetName
                     
                     # [修改] 标记已找到，如果全找到了直接退出
-                    if targetName in remaining_targets:
-                        remaining_targets.remove(targetName)
+                    if targetSymbol in remaining_targets:
+                        remaining_targets.remove(targetSymbol)
                     if len(remaining_targets) == 0:
                         logger.debug(f"账号 {username} 所有目标好友均已找到，停止搜索")
                         return
@@ -113,7 +152,7 @@ def scroll_and_select_user(page, username, targets):
                 traceback.print_exc()
         else:
             # [修复] 检查本轮是否有新好友被发现
-            new_found = len(found_usernames) > prev_found_count
+            new_found = len(found_targets) > prev_found_count
             if new_found:
                 empty_scroll_count = 0  # 有新发现，重置计数器
             else:
@@ -181,6 +220,10 @@ def do_user_task(browser, username, cookies, targets):
         context.set_default_timeout(config["browserTimeout"])  # 设置所有操作的默认超时时间为 120 秒
 
         page = context.new_page()
+        
+        if matchMode == "short_id":  # 使用抖音号进行匹配
+            page.on("response", handle_response)
+        
         # 打开抖音创作者中心
         retry_operation(
             "打开抖音创作者中心",
